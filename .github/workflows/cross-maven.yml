@@ -1,0 +1,126 @@
+#
+# Copyright Debezium Authors
+#
+# Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+#
+name: Cross Maven CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 2.*
+      - 3.*
+      - 4.*
+    paths-ignore:
+      - '*.md'
+
+jobs:
+  check-signed-commits:
+    name: Check signed commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: debezium/dbz/.github/actions/check-dco@main
+
+  build_core:
+    needs: [ check-signed-commits ]
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.cache-key-generator.outputs.cache-key }}
+    steps:
+      - name: Check if pull request branch exists in debezium main repository
+        id: branch
+        env:
+          branch_name: ${{ github.head_ref }}
+        run: |
+          curl --silent -X "GET" https://api.github.com/repos/debezium/debezium/pulls | jq '.[] | {branch: .head.ref}' | jq -r '.branch' >> SORTED_PULLS.txt
+
+          while IFS=" " read -r BRANCH;
+          do
+            if grep -q "$branch_name" <<< "$BRANCH"; then
+              echo "BRANCH_FOUND=true" >> $GITHUB_OUTPUT
+            fi
+          done < SORTED_PULLS.txt
+
+      - name: Checkout core repository with pull request branch
+        if: ${{ steps.branch.outputs.BRANCH_FOUND == 'true' }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.user.login }}/debezium
+          ref: ${{ github.head_ref }}
+          path: core
+
+      - name: Checkout core repository with default base branch
+        if: ${{ steps.branch.outputs.BRANCH_FOUND != 'true' }}
+        uses: actions/checkout@v6
+        with:
+          repository: debezium/debezium
+          ref: ${{ github.base_ref }}
+          path: core
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Generate Cache Key
+        id: cache-key-generator
+        run: echo "cache-key=${{ runner.os }}-m2-${{ hashFiles('core/**/pom.xml','core/**/*.java') }}${{ steps.branch.outputs.BRANCH_FOUND == 'true' && github.head_ref || '' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Maven Repository
+        id: cache-check
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ steps.cache-key-generator.outputs.cache-key }}
+          restore-keys: ${{ steps.cache-key-generator.outputs.cache-key }}
+
+      - name: Build Debezium (Core)
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        run: >
+          ./core/mvnw clean install -B -ntp -f core/pom.xml
+          -pl debezium-assembly-descriptors,debezium-bom,debezium-connector-common,debezium-config,debezium-util,debezium-embedded,:debezium-storage-file,:debezium-storage-kafka,:debezium-ide-configs,:debezium-checkstyle,:debezium-revapi,debezium-connect-plugins
+          -am
+          -DskipTests=true
+          -DskipITs=true
+          -Dcheckstyle.skip=true
+          -Dformat.skip=true
+          -Drevapi.skip=true
+          -Dhttp.keepAlive=false
+          -Dmaven.wagon.http.pool=false
+          -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+
+  build_neo4j:
+    name: 'Neo4j - assembly'
+    needs: [ build_core ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Action (Neo4j)
+        uses: actions/checkout@v6
+        with:
+          path: neo4j
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Cache Maven Repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ needs.build_core.outputs.cache-key }}
+          restore-keys: ${{ needs.build_core.outputs.cache-key }}
+
+      - name: Build Neo4j Connector
+        run: >
+          ./neo4j/mvnw clean install -B -ntp -f neo4j/pom.xml
+          -Passembly
+          -Dformat.formatter.goal=validate
+          -Dformat.imports.goal=check
+          -Dhttp.keepAlive=false
+          -Dmaven.wagon.http.pool=false
+          -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+          -DskipITs
